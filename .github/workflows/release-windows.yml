@@ -1,0 +1,89 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Windows amd64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Install MinGW cross-compiler (posix threads)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+
+      - name: Create MinGW compatibility header
+        run: |
+          cat > /tmp/mingw-compat.h << 'HEADER'
+          #ifndef _MINGW_THREAD_THROTTLE_COMPAT
+          #define _MINGW_THREAD_THROTTLE_COMPAT
+          #ifndef THREAD_POWER_THROTTLING_CURRENT_VERSION
+          typedef struct {
+              unsigned long Version;
+              unsigned long ControlMask;
+              unsigned long StateMask;
+          } THREAD_POWER_THROTTLING_STATE;
+          #define THREAD_POWER_THROTTLING_CURRENT_VERSION 1
+          #define THREAD_POWER_THROTTLING_EXECUTION_SPEED 0x1
+          #endif
+          #endif
+          HEADER
+
+      - name: Build whisper.cpp
+        run: |
+          git clone https://github.com/ggerganov/whisper.cpp.git /tmp/whisper.cpp
+          cd /tmp/whisper.cpp
+          git checkout 4979e04f5dca
+          cmake -B build \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENMP=ON \
+            -DCMAKE_C_FLAGS="-include /tmp/mingw-compat.h" \
+            -DCMAKE_CXX_FLAGS="-include /tmp/mingw-compat.h"
+          cmake --build build --config Release -j$(nproc)
+          rm -f "$GITHUB_WORKSPACE"/library/*.a
+          find build -name "*.a" -exec cp {} "$GITHUB_WORKSPACE/library/" \;
+          cd "$GITHUB_WORKSPACE/library"
+          for f in *.a; do
+            case "$f" in lib*) ;; *) mv "$f" "lib$f" ;; esac
+          done
+          ls -la "$GITHUB_WORKSPACE/library/"
+
+      - name: Build chatlog
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '1'
+          CC: x86_64-w64-mingw32-gcc
+          CXX: x86_64-w64-mingw32-g++
+        run: |
+          CGO_CFLAGS="-I$(pwd)/include" \
+          CGO_LDFLAGS="-L$(pwd)/library -lstdc++ -lgomp -lpthread -static" \
+          go build -trimpath -tags fts5 -ldflags="-s -w" -o chatlog.exe main.go
+
+      - name: Compress with UPX
+        uses: crazy-max/ghaction-upx@v3
+        with:
+          version: latest
+          files: chatlog.exe
+          args: --best --lzma
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatlog-windows-amd64
+          path: chatlog.exe
